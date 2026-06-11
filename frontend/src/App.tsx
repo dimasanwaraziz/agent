@@ -10,7 +10,9 @@ import {
   Loader2,
   RefreshCw,
   MemoryStick,
-  BarChart3
+  BarChart3,
+  Download,
+  Upload
 } from 'lucide-react';
 import './App.css';
 
@@ -392,6 +394,61 @@ export default function App() {
     }
   };
 
+  const handleExportMemories = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/memories/export`);
+      if (res.ok) {
+        const blob = await res.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `memories_export_${new Date().toISOString().slice(0, 10)}.json`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        window.URL.revokeObjectURL(url);
+      } else {
+        alert('Gagal mengekspor memori.');
+      }
+    } catch (err: any) {
+      alert(`Error ekspor: ${err.message}`);
+    }
+  };
+
+  const handleImportMemories = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = async (event) => {
+      try {
+        const json = JSON.parse(event.target?.result as string);
+        if (!Array.isArray(json)) {
+          alert('Format file salah. File harus berupa array JSON memori.');
+          return;
+        }
+
+        const res = await fetch(`${API_BASE}/memories/import`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ memories: json })
+        });
+
+        if (res.ok) {
+          const data = await res.json();
+          alert(`Sukses mengimpor ${data.count} memori baru!`);
+          fetchMemories();
+        } else {
+          alert('Gagal mengimpor memori.');
+        }
+      } catch (err: any) {
+        alert(`Gagal membaca file: ${err.message}`);
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+  };
+
   // Filter memories list based on search bar query
   const filteredMemories = memories.filter(m => 
     m.content.toLowerCase().includes(searchQuery.toLowerCase())
@@ -586,10 +643,58 @@ export default function App() {
         {/* Tab 2: Memory Manager */}
         {activeTab === 'memories' && (
           <div className="memories-panel">
-            <div className="memories-header">
+            <div className="memories-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '16px' }}>
               <div className="memories-title-section">
                 <h2>Daya Ingat Jangka Panjang</h2>
                 <p>Memori yang disimpan asisten secara otomatis (atau manual) dan diindex via pgvector.</p>
+              </div>
+              <div style={{ display: 'flex', gap: '12px' }}>
+                <button 
+                  onClick={handleExportMemories}
+                  type="button"
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '8px',
+                    padding: '8px 16px',
+                    fontSize: '0.85rem',
+                    fontWeight: 500,
+                    border: '1px solid var(--border-color)',
+                    borderRadius: '6px',
+                    background: 'var(--bg-card)',
+                    color: 'var(--text-main)',
+                    cursor: 'pointer',
+                    transition: 'all 0.2s'
+                  }}
+                >
+                  <Download size={15} />
+                  Export
+                </button>
+                <label 
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '8px',
+                    padding: '8px 16px',
+                    fontSize: '0.85rem',
+                    fontWeight: 500,
+                    border: '1px solid var(--border-color)',
+                    borderRadius: '6px',
+                    background: 'var(--bg-card)',
+                    color: 'var(--text-main)',
+                    cursor: 'pointer',
+                    transition: 'all 0.2s'
+                  }}
+                >
+                  <Upload size={15} />
+                  Import
+                  <input 
+                    type="file" 
+                    accept=".json" 
+                    onChange={handleImportMemories} 
+                    style={{ display: 'none' }} 
+                  />
+                </label>
               </div>
             </div>
 

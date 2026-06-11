@@ -240,6 +240,64 @@ app.post('/api/memories', async (req, res) => {
   }
 });
 
+app.get('/api/memories/export', async (req, res) => {
+  try {
+    const result = await db.query('SELECT content, embedding::text, created_at FROM memories ORDER BY created_at DESC');
+    const exported = result.rows.map(row => {
+      let vector = [];
+      if (row.embedding) {
+        try {
+          vector = JSON.parse(row.embedding);
+        } catch (e) {
+          vector = row.embedding.replace(/[\[\]]/g, '').split(',').map(Number);
+        }
+      }
+      return {
+        content: row.content,
+        embedding: vector,
+        createdAt: row.created_at
+      };
+    });
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', 'attachment; filename=memories_export.json');
+    res.json(exported);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/memories/import', async (req, res) => {
+  try {
+    const { memories } = req.body;
+    if (!Array.isArray(memories)) {
+      return res.status(400).json({ error: 'Memories array is required' });
+    }
+    const { getEmbedding } = await import('./embeddings.js');
+    let importedCount = 0;
+    for (const mem of memories) {
+      if (!mem.content) continue;
+      const checkRes = await db.query('SELECT 1 FROM memories WHERE content = $1', [mem.content]);
+      if (checkRes.rowCount > 0) {
+        continue; // Skip duplicates
+      }
+      let vector = mem.embedding;
+      if (!Array.isArray(vector) || vector.length === 0) {
+        vector = await getEmbedding(mem.content);
+      }
+      const vectorStr = `[${vector.join(',')}]`;
+      const createdAt = mem.createdAt ? new Date(mem.createdAt) : new Date();
+      await db.query(
+        'INSERT INTO memories (content, embedding, created_at) VALUES ($1, $2, $3)',
+        [mem.content, vectorStr, createdAt]
+      );
+      importedCount++;
+    }
+    res.json({ success: true, count: importedCount });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // 4. Messages History
 app.get('/api/messages', async (req, res) => {
   try {
