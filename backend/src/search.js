@@ -21,40 +21,67 @@ export async function searchWeb(query) {
     const html = await response.text();
     const results = [];
     
-    // DuckDuckGo Lite HTML results are inside elements with result__snippet and result__a
-    // We parse it using regex to avoid extra package dependencies (cheerio, etc.)
-    // A standard result entry consists of title/link and snippet
-    const resultRegex = /<a class="result__a" href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+    // Split the html by "result__body" to isolate each search result element
+    const blocks = html.split('result__body');
     
-    let match;
-    let count = 0;
-    while ((match = resultRegex.exec(html)) !== null && count < 4) {
-      let link = match[1];
+    // The first block is header content, skip it
+    for (let i = 1; i < blocks.length && results.length < 5; i++) {
+      const block = blocks[i];
       
-      // Clean up redirections by DuckDuckGo (e.g. //duckduckgo.com/l/?uddg=https%3A%2F%2F...)
-      if (link.startsWith('//')) {
-        link = 'https:' + link;
-      }
-      if (link.includes('uddg=')) {
-        try {
-          const urlObj = new URL(link);
-          const uddg = urlObj.searchParams.get('uddg');
-          if (uddg) link = decodeURIComponent(uddg);
-        } catch {
-          // Fallback if URL parsing fails
+      // Extract URL and Title from class="result__a"
+      const urlMatch = block.match(/href="([^"]+)"[^>]*class="[^"]*result__a[^"]*"[^>]*>([\s\S]*?)<\/a>/) || 
+                       block.match(/class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/);
+                       
+      // Extract snippet from class="result__snippet"
+      const snippetMatch = block.match(/class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/);
+      
+      if (urlMatch && snippetMatch) {
+        let link = urlMatch[1];
+        let title = urlMatch[2].replace(/<[^>]*>/g, '').trim();
+        let snippet = snippetMatch[1].replace(/<[^>]*>/g, '').trim();
+        
+        // Skip ad links
+        if (link.includes('duckduckgo.com/y.js') || link.includes('ad_domain')) {
+          continue;
         }
-      }
-      
-      const title = match[2].replace(/<[^>]*>/g, '').trim();
-      const snippet = match[3].replace(/<[^>]*>/g, '').trim();
-      
-      if (title && snippet) {
+
+        // Clean HTML entities
+        title = title
+          .replace(/&amp;/g, '&')
+          .replace(/&lt;/g, '<')
+          .replace(/&gt;/g, '>')
+          .replace(/&quot;/g, '"')
+          .replace(/&#x27;/g, "'");
+
+        snippet = snippet
+          .replace(/&amp;/g, '&')
+          .replace(/&lt;/g, '<')
+          .replace(/&gt;/g, '>')
+          .replace(/&quot;/g, '"')
+          .replace(/&#x27;/g, "'")
+          .replace(/<b>/g, '')
+          .replace(/<\/b>/g, '');
+        
+        if (link.startsWith('//')) {
+          link = 'https:' + link;
+        }
+        
+        // Resolve DuckDuckGo redirects to get the clean target URL
+        if (link.includes('uddg=')) {
+          try {
+            const urlObj = new URL(link);
+            const uddg = urlObj.searchParams.get('uddg');
+            if (uddg) link = decodeURIComponent(uddg);
+          } catch {
+            // Keep original if decoding fails
+          }
+        }
+        
         results.push({ title, link, snippet });
-        count++;
       }
     }
     
-    console.log(`Found ${results.length} web search results.`);
+    console.log(`Found ${results.length} web search results (ad filtered).`);
     return results;
   } catch (error) {
     console.error('Failed to perform web search:', error);
