@@ -1,7 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import * as db from './db.js';
-import { callLLM, extractAndStoreMemories } from './llm.js';
+import { callLLM, callLLMWithUsage, extractAndStoreMemories } from './llm.js';
 import { retrieveRelevantMemories } from './memoryService.js';
 import { initTelegramBot } from './telegram.js';
 import { searchWeb } from './search.js';
@@ -32,7 +32,9 @@ async function getActiveSettings() {
     systemPrompt: currentSettings.systemPrompt || 'You are a helpful personal assistant with an excellent long-term memory. Be helpful, concise, and friendly.',
     temperature: currentSettings.temperature !== undefined ? parseFloat(currentSettings.temperature) : 0.7,
     memorySimilarity: currentSettings.memorySimilarity !== undefined ? parseFloat(currentSettings.memorySimilarity) : 0.4,
-    telegramBotToken: currentSettings.telegramBotToken || ''
+    telegramBotToken: currentSettings.telegramBotToken || '',
+    inputCostPerMillion: currentSettings.inputCostPerMillion !== undefined ? parseFloat(currentSettings.inputCostPerMillion) : 0.15,
+    outputCostPerMillion: currentSettings.outputCostPerMillion !== undefined ? parseFloat(currentSettings.outputCostPerMillion) : 0.60
   };
 }
 
@@ -92,7 +94,7 @@ app.get('/api/settings', async (req, res) => {
 
 app.post('/api/settings', async (req, res) => {
   try {
-    const { apiBaseUrl, apiKey, model, systemPrompt, temperature, memorySimilarity, telegramBotToken } = req.body;
+    const { apiBaseUrl, apiKey, model, systemPrompt, temperature, memorySimilarity, telegramBotToken, inputCostPerMillion, outputCostPerMillion } = req.body;
     
     if (apiBaseUrl !== undefined) await db.saveSetting('apiBaseUrl', apiBaseUrl);
     if (apiKey !== undefined) await db.saveSetting('apiKey', apiKey);
@@ -101,11 +103,45 @@ app.post('/api/settings', async (req, res) => {
     if (temperature !== undefined) await db.saveSetting('temperature', temperature.toString());
     if (memorySimilarity !== undefined) await db.saveSetting('memorySimilarity', memorySimilarity.toString());
     if (telegramBotToken !== undefined) await db.saveSetting('telegramBotToken', telegramBotToken);
+    if (inputCostPerMillion !== undefined) await db.saveSetting('inputCostPerMillion', inputCostPerMillion.toString());
+    if (outputCostPerMillion !== undefined) await db.saveSetting('outputCostPerMillion', outputCostPerMillion.toString());
 
     // Restart Telegram Bot with new settings
     initTelegramBot();
 
     res.json({ message: 'Settings saved successfully' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 2.2 Token Usage Stats Endpoint
+app.get('/api/usage', async (req, res) => {
+  try {
+    const settings = await getActiveSettings();
+    const result = await db.query(
+      `SELECT 
+         COALESCE(SUM(prompt_tokens), 0) AS total_prompt_tokens,
+         COALESCE(SUM(completion_tokens), 0) AS total_completion_tokens
+       FROM messages`
+    );
+
+    const promptTokens = parseInt(result.rows[0].total_prompt_tokens);
+    const completionTokens = parseInt(result.rows[0].total_completion_tokens);
+    const totalTokens = promptTokens + completionTokens;
+
+    const inputCost = (promptTokens / 1000000) * settings.inputCostPerMillion;
+    const outputCost = (completionTokens / 1000000) * settings.outputCostPerMillion;
+    const totalCost = inputCost + outputCost;
+
+    res.json({
+      promptTokens,
+      completionTokens,
+      totalTokens,
+      totalCost: parseFloat(totalCost.toFixed(6)),
+      inputCostPerMillion: settings.inputCostPerMillion,
+      outputCostPerMillion: settings.outputCostPerMillion
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -157,7 +193,7 @@ app.get('/api/messages', async (req, res) => {
     if (!sessionId) return res.status(400).json({ error: 'sessionId is required' });
 
     const result = await db.query(
-      'SELECT role, content, created_at FROM messages WHERE session_id = $1 ORDER BY created_at ASC',
+      'SELECT role, content, prompt_tokens, completion_tokens, created_at FROM messages WHERE session_id = $1 ORDER BY created_at ASC',
       [sessionId]
     );
     res.json(result.rows);
@@ -272,13 +308,13 @@ app.post('/api/chat', async (req, res) => {
       ...shortTermHistory.map(m => ({ role: m.role, content: m.content }))
     ];
 
-    // F. Call LLM
-    const assistantResponse = await callLLM(llmMessages, settings);
+    // F. Call LLM with token usage tracking
+    const { content: assistantResponse, usage } = await callLLMWithUsage(llmMessages, settings);
 
-    // G. Save Assistant Message to DB
+    // G. Save Assistant Message and token stats to DB
     await db.query(
-      'INSERT INTO messages (session_id, role, content) VALUES ($1, $2, $3)',
-      [sessionId, 'assistant', assistantResponse]
+      'INSERT INTO messages (session_id, role, content, prompt_tokens, completion_tokens) VALUES ($1, $2, $3, $4, $5)',
+      [sessionId, 'assistant', assistantResponse, usage.prompt_tokens, usage.completion_tokens]
     );
 
     // H. Schedule background memory extraction (do not await to speed up response)
@@ -286,11 +322,44 @@ app.post('/api/chat', async (req, res) => {
 
     res.json({
       response: assistantResponse,
-      memoriesUsed: matchingMemories
+      memoriesUsed: matchingMemories,
+      usage
     });
 
   } catch (error) {
     console.error('Chat endpoint error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 6. Analytics Endpoint
+app.get('/api/analytics', async (req, res) => {
+  try {
+    const { interval } = req.query; // 'hour' or 'day'
+    const bucket = interval === 'hour' ? 'hour' : 'day';
+    const limit = interval === 'hour' ? 24 : 30;
+
+    const result = await db.query(
+      `SELECT 
+         DATE_TRUNC($1, created_at) AS time_bucket,
+         COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+         COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+         COALESCE(SUM(prompt_tokens + completion_tokens), 0) AS total_tokens
+       FROM messages
+       WHERE role = 'assistant'
+       GROUP BY time_bucket
+       ORDER BY time_bucket ASC
+       LIMIT $2`,
+      [bucket, limit]
+    );
+
+    res.json(result.rows.map(row => ({
+      timeBucket: row.time_bucket,
+      promptTokens: parseInt(row.prompt_tokens),
+      completionTokens: parseInt(row.completion_tokens),
+      totalTokens: parseInt(row.total_tokens)
+    })));
+  } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });

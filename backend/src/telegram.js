@@ -1,5 +1,5 @@
 import * as db from './db.js';
-import { callLLM, extractAndStoreMemories } from './llm.js';
+import { callLLM, callLLMWithUsage, extractAndStoreMemories } from './llm.js';
 import { retrieveRelevantMemories } from './memoryService.js';
 import { searchWeb } from './search.js';
 
@@ -182,13 +182,13 @@ async function handleTelegramMessage(token, chatId, userText) {
       body: JSON.stringify({ chat_id: chatId, action: 'typing' })
     }).catch(() => {});
 
-    // 6. Call LLM
-    const botResponse = await callLLM(messages, settings);
+    // 6. Call LLM with token usage tracking
+    const { content: botResponse, usage } = await callLLMWithUsage(messages, settings);
 
-    // 7. Save bot response to DB
+    // 7. Save bot response to DB with token stats
     await db.query(
-      'INSERT INTO messages (session_id, role, content) VALUES ($1, $2, $3)',
-      [chatId, 'assistant', botResponse]
+      'INSERT INTO messages (session_id, role, content, prompt_tokens, completion_tokens) VALUES ($1, $2, $3, $4, $5)',
+      [chatId, 'assistant', botResponse, usage.prompt_tokens, usage.completion_tokens]
     );
 
     // 8. Send message to Telegram

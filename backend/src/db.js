@@ -44,6 +44,13 @@ export async function initDb() {
       )
     `);
 
+    // Add token columns to messages table for cost estimation tracking
+    await client.query(`
+      ALTER TABLE messages 
+      ADD COLUMN IF NOT EXISTS prompt_tokens INT DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS completion_tokens INT DEFAULT 0
+    `);
+
     console.log('Database schema initialized successfully.');
   } catch (error) {
     console.error('Error initializing database:', error);

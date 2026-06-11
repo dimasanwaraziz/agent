@@ -9,7 +9,8 @@ import {
   Plus, 
   Loader2,
   RefreshCw,
-  MemoryStick
+  MemoryStick,
+  BarChart3
 } from 'lucide-react';
 import './App.css';
 
@@ -22,6 +23,8 @@ interface Message {
   role: 'user' | 'assistant';
   content: string;
   created_at?: string;
+  prompt_tokens?: number;
+  completion_tokens?: number;
 }
 
 interface Memory {
@@ -49,10 +52,12 @@ interface AgentSettings {
   temperature: number;
   memorySimilarity: number;
   telegramBotToken: string;
+  inputCostPerMillion: number;
+  outputCostPerMillion: number;
 }
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'chat' | 'memories' | 'settings'>('chat');
+  const [activeTab, setActiveTab] = useState<'chat' | 'memories' | 'analytics' | 'settings'>('chat');
   const [sessionId] = useState<string>(() => {
     // Persistent sessionId in localStorage to keep session across refreshes
     const saved = localStorage.getItem('agent_session_id');
@@ -87,8 +92,25 @@ export default function App() {
     systemPrompt: '',
     temperature: 0.7,
     memorySimilarity: 0.4,
-    telegramBotToken: ''
+    telegramBotToken: '',
+    inputCostPerMillion: 0.15,
+    outputCostPerMillion: 0.60
   });
+
+  const [usageStats, setUsageStats] = useState<{
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+    totalCost: number;
+  } | null>(null);
+
+  const [analyticsInterval, setAnalyticsInterval] = useState<'hour' | 'day'>('day');
+  const [analyticsData, setAnalyticsData] = useState<Array<{ 
+    timeBucket: string; 
+    promptTokens: number; 
+    completionTokens: number; 
+    totalTokens: number; 
+  }>>([]);
   const [savingSettings, setSavingSettings] = useState<boolean>(false);
   const [settingsStatusMessage, setSettingsStatusMessage] = useState<string>('');
 
@@ -146,16 +168,47 @@ export default function App() {
     }
   };
 
+  const fetchUsageStats = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/usage`);
+      if (res.ok) {
+        const data = await res.json();
+        setUsageStats(data);
+      }
+    } catch (err) {
+      console.error('Error fetching token usage:', err);
+    }
+  };
+
+  const fetchAnalyticsData = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/analytics?interval=${analyticsInterval}`);
+      if (res.ok) {
+        const data = await res.json();
+        setAnalyticsData(data);
+      }
+    } catch (err) {
+      console.error('Error fetching analytics:', err);
+    }
+  };
+
   useEffect(() => {
     checkStatus();
     fetchMessages();
     fetchMemories();
     fetchSettings();
+    fetchUsageStats();
 
     // Check status every 7 seconds
     const interval = setInterval(checkStatus, 7000);
     return () => clearInterval(interval);
   }, []);
+
+  useEffect(() => {
+    if (activeTab === 'analytics') {
+      fetchAnalyticsData();
+    }
+  }, [activeTab, analyticsInterval]);
 
   // Scroll to bottom of chat safely using container scrollTop to avoid browser window scrolling bugs
   useEffect(() => {
@@ -188,13 +241,22 @@ export default function App() {
 
       if (res.ok) {
         const data = await res.json();
-        setMessages(prev => [...prev, { role: 'assistant', content: data.response }]);
+        setMessages(prev => [...prev, { 
+          role: 'assistant', 
+          content: data.response,
+          prompt_tokens: data.usage?.prompt_tokens,
+          completion_tokens: data.usage?.completion_tokens
+        }]);
         // Update memories active during this interaction
         if (data.memoriesUsed) {
           setRetrievedMemories(data.memoriesUsed.map((m: any) => m.content));
         }
         // Refresh memories list in the background (as new ones may have been extracted)
-        setTimeout(fetchMemories, 1500);
+        setTimeout(() => {
+          fetchMemories();
+          fetchUsageStats();
+          if (activeTab === 'analytics') fetchAnalyticsData();
+        }, 1500);
       } else {
         const errorData = await res.json();
         setMessages(prev => [...prev, { 
@@ -321,6 +383,13 @@ export default function App() {
             Daya Ingat (Memori)
           </button>
           <button 
+            className={`nav-item ${activeTab === 'analytics' ? 'active' : ''}`}
+            onClick={() => setActiveTab('analytics')}
+          >
+            <BarChart3 size={18} />
+            Statistik Penggunaan
+          </button>
+          <button 
             className={`nav-item ${activeTab === 'settings' ? 'active' : ''}`}
             onClick={() => setActiveTab('settings')}
           >
@@ -360,6 +429,17 @@ export default function App() {
               Connection: {status.llmError || 'Cannot ping endpoint'}
             </div>
           )}
+
+          <div style={{ height: '1px', background: 'var(--border-color)', margin: '12px 0' }}></div>
+          <div className="status-title">Usage & Cost Estimation</div>
+          <div className="status-row">
+            <span>Total Tokens:</span>
+            <span style={{ fontWeight: 600 }}>{usageStats ? `${(usageStats.totalTokens / 1000).toFixed(1)}k` : '0.0k'}</span>
+          </div>
+          <div className="status-row">
+            <span>Est. Cost (USD):</span>
+            <span style={{ fontWeight: 600, color: 'var(--accent-color)' }}>{usageStats ? `$${usageStats.totalCost.toFixed(5)}` : '$0.00000'}</span>
+          </div>
         </div>
       </div>
 
@@ -389,7 +469,24 @@ export default function App() {
                 ) : (
                   messages.map((msg, i) => (
                     <div key={i} className={`message-bubble ${msg.role}`}>
-                      {msg.content}
+                      <div style={{ whiteSpace: 'pre-wrap' }}>{msg.content}</div>
+                      {msg.role === 'assistant' && msg.prompt_tokens !== undefined && msg.prompt_tokens > 0 && (
+                        <div style={{ 
+                          fontSize: '0.7rem', 
+                          color: 'var(--text-muted)', 
+                          marginTop: '8px', 
+                          borderTop: '1px solid rgba(255,255,255,0.06)', 
+                          paddingTop: '6px',
+                          display: 'flex',
+                          justifyContent: 'space-between',
+                          gap: '12px'
+                        }}>
+                          <span>⚡ {msg.prompt_tokens + msg.completion_tokens!} tkn ({msg.prompt_tokens} in, {msg.completion_tokens} out)</span>
+                          <span style={{ color: 'var(--accent-color)' }}>
+                            Est: ${(((msg.prompt_tokens * settings.inputCostPerMillion) + (msg.completion_tokens! * settings.outputCostPerMillion)) / 1000000).toFixed(5)}
+                          </span>
+                        </div>
+                      )}
                     </div>
                   ))
                 )}
@@ -505,6 +602,119 @@ export default function App() {
           </div>
         )}
 
+        {/* Tab 2.5: Analytics Dashboard */}
+        {activeTab === 'analytics' && (
+          <div className="memories-panel">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <div className="memories-title-section">
+                <h2>Statistik & Biaya Token</h2>
+                <p>Pantau volume penggunaan token dan estimasi biaya berdasarkan waktu.</p>
+              </div>
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <button 
+                  style={{ height: '36px', padding: '0 16px', background: analyticsInterval === 'hour' ? 'var(--primary-color)' : 'rgba(255,255,255,0.05)', color: '#fff', border: 'none', borderRadius: '8px', cursor: 'pointer', fontWeight: 600, fontSize: '0.85rem' }}
+                  onClick={() => setAnalyticsInterval('hour')}
+                >
+                  Per Jam (24j)
+                </button>
+                <button 
+                  style={{ height: '36px', padding: '0 16px', background: analyticsInterval === 'day' ? 'var(--primary-color)' : 'rgba(255,255,255,0.05)', color: '#fff', border: 'none', borderRadius: '8px', cursor: 'pointer', fontWeight: 600, fontSize: '0.85rem' }}
+                  onClick={() => setAnalyticsInterval('day')}
+                >
+                  Per Hari (30h)
+                </button>
+              </div>
+            </div>
+
+            <div className="glass" style={{ padding: '24px', flexGrow: 1, display: 'flex', flexDirection: 'column', gap: '20px', minHeight: '350px' }}>
+              {analyticsData.length === 0 ? (
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--text-muted)', paddingTop: '60px', paddingBottom: '60px' }}>
+                  <BarChart3 size={48} style={{ opacity: 0.2, marginBottom: '16px' }} />
+                  <p style={{ fontWeight: 500 }}>Belum ada data statistik penggunaan.</p>
+                  <p style={{ fontSize: '0.85rem', opacity: 0.7 }}>Kirimkan chat pesan ke asisten terlebih dahulu untuk merekam data token.</p>
+                </div>
+              ) : (
+                <>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.9rem', color: 'var(--text-secondary)' }}>
+                    <span>Stacked Chart: Ungu (Input) | Cyan (Output)</span>
+                    <span style={{ fontWeight: 600, color: 'var(--accent-color)' }}>
+                      Total Biaya Periode Ini: ${
+                        (analyticsData.reduce((acc, curr) => acc + (curr.promptTokens * settings.inputCostPerMillion + curr.completionTokens * settings.outputCostPerMillion), 0) / 1000000).toFixed(5)
+                      }
+                    </span>
+                  </div>
+
+                  <div style={{ flexGrow: 1, position: 'relative', height: '240px', display: 'flex', alignItems: 'flex-end', gap: '16px', paddingBottom: '32px', borderBottom: '1px solid var(--border-color)', overflowX: 'auto', paddingTop: '20px' }}>
+                    {(() => {
+                      const maxTokens = Math.max(...analyticsData.map(d => d.totalTokens), 1000);
+                      return analyticsData.map((d, index) => {
+                        let label = '';
+                        try {
+                          const dateObj = new Date(d.timeBucket);
+                          label = analyticsInterval === 'hour' 
+                            ? `${dateObj.getHours().toString().padStart(2, '0')}:00`
+                            : `${dateObj.getDate()}/${dateObj.getMonth() + 1}`;
+                        } catch {
+                          label = d.timeBucket;
+                        }
+
+                        return (
+                          <div 
+                            key={index} 
+                            style={{ 
+                              display: 'flex', 
+                              flexDirection: 'column', 
+                              alignItems: 'center', 
+                              flexGrow: 1, 
+                              minWidth: '40px',
+                              height: '100%',
+                              justifyContent: 'flex-end',
+                              position: 'relative'
+                            }}
+                            title={`Total: ${d.totalTokens} tkn\nPrompt: ${d.promptTokens} in\nCompletion: ${d.completionTokens} out`}
+                          >
+                            <div style={{ width: '16px', height: `${(d.totalTokens / maxTokens) * 100}%`, display: 'flex', flexDirection: 'column-reverse', borderRadius: '4px', overflow: 'hidden' }}>
+                              <div style={{ width: '100%', height: `${(d.promptTokens / d.totalTokens) * 100}%`, background: 'linear-gradient(to top, var(--primary-color), #818cf8)' }} />
+                              <div style={{ width: '100%', height: `${(d.completionTokens / d.totalTokens) * 100}%`, background: 'linear-gradient(to top, var(--accent-color), #22d3ee)' }} />
+                            </div>
+
+                            <span style={{ position: 'absolute', bottom: '-28px', fontSize: '0.7rem', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
+                              {label}
+                            </span>
+                          </div>
+                        );
+                      });
+                    })()}
+                  </div>
+                </>
+              )}
+            </div>
+            
+            {analyticsData.length > 0 && (
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '16px', marginTop: '12px' }}>
+                <div className="glass" style={{ padding: '16px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                  <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', fontWeight: 600 }}>RATA-RATA TOKEN / CHAT</span>
+                  <span style={{ fontSize: '1.5rem', fontWeight: 700 }}>
+                    {Math.round(analyticsData.reduce((acc, curr) => acc + curr.totalTokens, 0) / analyticsData.length)}
+                  </span>
+                </div>
+                <div className="glass" style={{ padding: '16px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                  <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', fontWeight: 600 }}>MAX TOKEN SINGLE CHAT</span>
+                  <span style={{ fontSize: '1.5rem', fontWeight: 700 }}>
+                    {Math.max(...analyticsData.map(d => d.totalTokens))}
+                  </span>
+                </div>
+                <div className="glass" style={{ padding: '16px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                  <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', fontWeight: 600 }}>AKUMULASI TOTAL TOKEN</span>
+                  <span style={{ fontSize: '1.5rem', fontWeight: 700, color: 'var(--primary-color)' }}>
+                    {analyticsData.reduce((acc, curr) => acc + curr.totalTokens, 0).toLocaleString()}
+                  </span>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Tab 3: Configuration Settings */}
         {activeTab === 'settings' && (
           <div className="settings-panel">
@@ -614,6 +824,43 @@ export default function App() {
                     Nilai lebih tinggi = pencocokan memori lebih ketat / relevan. Default: 0.4.
                   </span>
                 </div>
+              </div>
+
+              <div className="settings-section">
+                <div className="settings-section-title">
+                  <Database size={18} style={{ color: 'var(--accent-color)' }} />
+                  <span>Estimasi Biaya Penggunaan Model (USD)</span>
+                </div>
+                
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
+                  <div className="form-group">
+                    <label htmlFor="inputCost">Harga per 1 Juta Input Token ($)</label>
+                    <input 
+                      id="inputCost"
+                      type="number" 
+                      step="0.001"
+                      className="form-control"
+                      placeholder="Contoh: 0.15"
+                      value={settings.inputCostPerMillion}
+                      onChange={(e) => setSettings({ ...settings, inputCostPerMillion: parseFloat(e.target.value) || 0 })}
+                    />
+                  </div>
+                  <div className="form-group">
+                    <label htmlFor="outputCost">Harga per 1 Juta Output Token ($)</label>
+                    <input 
+                      id="outputCost"
+                      type="number" 
+                      step="0.001"
+                      className="form-control"
+                      placeholder="Contoh: 0.60"
+                      value={settings.outputCostPerMillion}
+                      onChange={(e) => setSettings({ ...settings, outputCostPerMillion: parseFloat(e.target.value) || 0 })}
+                    />
+                  </div>
+                </div>
+                <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                  Gunakan harga resmi dari provider model Anda untuk estimasi akurat. Setel ke 0 jika menggunakan Ollama lokal gratis.
+                </span>
               </div>
 
               <div className="settings-section">

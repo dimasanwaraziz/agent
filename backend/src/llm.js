@@ -2,12 +2,12 @@ import { getEmbedding } from './embeddings.js';
 import * as db from './db.js';
 
 /**
- * Call the OpenAI-compatible Chat Completion API
+ * Call the OpenAI-compatible Chat Completion API and return content and token usage
  * @param {Array} messages 
  * @param {Object} settings 
- * @returns {Promise<string>}
+ * @returns {Promise<{content: string, usage: {prompt_tokens: number, completion_tokens: number, total_tokens: number}}>}
  */
-export async function callLLM(messages, settings) {
+export async function callLLMWithUsage(messages, settings) {
   const apiBaseUrl = settings.apiBaseUrl || 'http://localhost:11434/v1';
   const apiKey = settings.apiKey || '';
   const model = settings.model || 'llama3';
@@ -45,7 +45,32 @@ export async function callLLM(messages, settings) {
     throw new Error('LLM API returned an empty choice list');
   }
 
-  return data.choices[0].message.content;
+  const content = data.choices[0].message.content;
+  
+  // Calculate approximate token usage if API does not return it (1 token approx 4 chars)
+  const promptText = JSON.stringify(messages);
+  const promptTokens = data.usage?.prompt_tokens || Math.ceil(promptText.length / 4);
+  const completionTokens = data.usage?.completion_tokens || Math.ceil(content.length / 4);
+
+  return {
+    content,
+    usage: {
+      prompt_tokens: promptTokens,
+      completion_tokens: completionTokens,
+      total_tokens: promptTokens + completionTokens
+    }
+  };
+}
+
+/**
+ * Call the OpenAI-compatible Chat Completion API and return content only
+ * @param {Array} messages 
+ * @param {Object} settings 
+ * @returns {Promise<string>}
+ */
+export async function callLLM(messages, settings) {
+  const result = await callLLMWithUsage(messages, settings);
+  return result.content;
 }
 
 /**
