@@ -267,6 +267,13 @@ IMPORTANT RULES:
       ...shortTermHistory.map(h => ({ role: h.role, content: h.content }))
     ];
 
+    if (isSshConfigured) {
+      activeMessages.push({
+        role: 'system',
+        content: 'REMINDER: If the user is asking you to list files, read/write/compile/run code, or run any terminal command on the server, you MUST use the <ssh_run>COMMAND</ssh_run> tag to execute it. Do NOT make up or simulate the output. You must execute the real command to answer.'
+      });
+    }
+
     let loopCount = 0;
     const maxLoops = 5;
     let finalBotResponse = '';
