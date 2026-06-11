@@ -2,9 +2,13 @@ import * as db from './db.js';
 import { callLLM, callLLMWithUsage, extractAndStoreMemories } from './llm.js';
 import { retrieveRelevantMemories } from './memoryService.js';
 import { searchWeb } from './search.js';
+import { executeRemoteCommand } from './sshExecutor.js';
 
 let isRunning = false;
 let abortController = null;
+
+// Map to hold resolver functions for pending SSH command approvals
+const pendingApprovals = new Map();
 
 async function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -19,7 +23,12 @@ async function getActiveSettings() {
     systemPrompt: currentSettings.systemPrompt || 'You are a helpful personal assistant with an excellent long-term memory. Be helpful, concise, and friendly.',
     temperature: currentSettings.temperature !== undefined ? parseFloat(currentSettings.temperature) : 0.7,
     memorySimilarity: currentSettings.memorySimilarity !== undefined ? parseFloat(currentSettings.memorySimilarity) : 0.4,
-    telegramBotToken: currentSettings.telegramBotToken || ''
+    telegramBotToken: currentSettings.telegramBotToken || '',
+    sshHost: currentSettings.sshHost || '',
+    sshUser: currentSettings.sshUser || '',
+    sshPort: currentSettings.sshPort || '22',
+    sshPassword: currentSettings.sshPassword || '',
+    sshPrivateKey: currentSettings.sshPrivateKey || ''
   };
 }
 
@@ -79,6 +88,9 @@ async function runPollingLoop(token, signal) {
 
           // Do not await to allow concurrent handling of messages
           handleTelegramMessage(token, chatId, userText);
+        } else if (update.callback_query) {
+          // Handle button clicks for SSH execution approvals
+          handleTelegramCallback(token, update.callback_query);
         }
       }
     } catch (error) {
@@ -91,6 +103,56 @@ async function runPollingLoop(token, signal) {
     }
     await sleep(200);
   }
+}
+
+async function handleTelegramCallback(token, callbackQuery) {
+  const queryId = callbackQuery.id;
+  const chatId = callbackQuery.message.chat.id.toString();
+  const messageId = callbackQuery.message.message_id;
+  const data = callbackQuery.data; // Expected format "approve:pendingId" or "reject:pendingId"
+
+  const [action, pendingId] = data.split(':');
+  const pending = pendingApprovals.get(pendingId);
+
+  if (!pending) {
+    await fetch(`https://api.telegram.org/bot${token}/answerCallbackQuery`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        callback_query_id: queryId,
+        text: 'Sesi persetujuan telah kedaluwarsa atau sudah diproses.',
+        show_alert: true
+      })
+    }).catch(() => {});
+    return;
+  }
+
+  // Acknowledge immediately
+  await fetch(`https://api.telegram.org/bot${token}/answerCallbackQuery`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      callback_query_id: queryId,
+      text: action === 'approve' ? 'Perintah disetujui, menjalankan...' : 'Perintah ditolak.'
+    })
+  }).catch(() => {});
+
+  // Update the original markup text to reflect selection
+  const decisionText = action === 'approve' ? '🟢 Disetujui' : '🔴 Ditolak';
+  await fetch(`https://api.telegram.org/bot${token}/editMessageText`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: chatId,
+      message_id: messageId,
+      text: `⚠️ *Permintaan Eksekusi Perintah (Status: ${decisionText}):*\n\`\`\`bash\n${pending.command}\n\`\`\``,
+      parse_mode: 'Markdown'
+    })
+  }).catch(() => {});
+
+  // Resolve the promise waiting inside handleTelegramMessage
+  pending.resolve(action === 'approve');
+  pendingApprovals.delete(pendingId);
 }
 
 async function handleTelegramMessage(token, chatId, userText) {
@@ -165,48 +227,217 @@ async function handleTelegramMessage(token, chatId, userText) {
       console.error('Telegram Bot: Web search preprocessing failed:', err);
     }
 
+    let sshContext = '';
+    const isSshConfigured = !!(settings.sshHost && settings.sshUser);
+    if (isSshConfigured) {
+      sshContext = `\n\nREMOTE CODING & SERVER EXECUTION CAPABILITIES:
+You are equipped to write code, inspect files, compile, and execute terminal commands on the user's remote server via SSH.
+To execute a command on the remote server, output a command inside the following XML tag:
+<ssh_run>YOUR_COMMAND_HERE</ssh_run>
+
+For example, to list the current directory:
+<ssh_run>ls -la</ssh_run>
+
+To view the contents of a file:
+<ssh_run>cat src/main.js</ssh_run>
+
+To create or overwrite a file:
+<ssh_run>cat << 'EOF' > test.py
+print("Hello from PA")
+EOF</ssh_run>
+
+To run or compile a file:
+<ssh_run>python3 test.py</ssh_run>
+
+IMPORTANT RULES:
+1. Always output exactly one <ssh_run> tag per message. Once you output the tag, STOP generating text. The system will execute the command and return the output inside <ssh_output> tags.
+2. After receiving the output, you can choose to output another command or present your final answer.
+3. Be careful with command outputs. If you execute a script, ensure it finishes or has a reasonable timeout.
+4. Try to write files programmatically using non-interactive tools (like 'cat << "EOF" > path'). Avoid tools like nano, vim, or interactive prompts.
+5. If the user asks you to write code, deploy something, or fix an issue, proactively use these tools to perform the task!`;
+    }
+
     const systemMessage = {
       role: 'system',
-      content: `${settings.systemPrompt}\n\n${memoryContext}${webContext}\n\nPlease use the recalled facts or web search results if they are relevant to answer the user's message. Do not explicitly state "Based on the retrieved facts" or "According to the search results", just answer naturally as if you remember them yourself.`
+      content: `${settings.systemPrompt}\n\n${memoryContext}${webContext}${sshContext}\n\nPlease use the recalled facts, web search results, or remote execution outputs if they are relevant to answer the user's message.`
     };
 
-    const messages = [
+    let activeMessages = [
       systemMessage,
       ...shortTermHistory.map(h => ({ role: h.role, content: h.content }))
     ];
 
-    // 5. Send typing indicator
-    fetch(`https://api.telegram.org/bot${token}/sendChatAction`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, action: 'typing' })
-    }).catch(() => {});
+    let loopCount = 0;
+    const maxLoops = 5;
+    let finalBotResponse = '';
 
-    // 6. Call LLM with token usage tracking
-    const { content: botResponse, usage } = await callLLMWithUsage(messages, settings);
+    const sendTyping = () => {
+      fetch(`https://api.telegram.org/bot${token}/sendChatAction`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, action: 'typing' })
+      }).catch(() => {});
+    };
 
-    // 7. Save bot response to DB with token stats
-    await db.query(
-      'INSERT INTO messages (session_id, role, content, prompt_tokens, completion_tokens) VALUES ($1, $2, $3, $4, $5)',
-      [chatId, 'assistant', botResponse, usage.prompt_tokens, usage.completion_tokens]
-    );
+    while (loopCount < maxLoops) {
+      sendTyping();
+      console.log(`Telegram Bot: Executing loop step ${loopCount + 1}...`);
+      const { content, usage } = await callLLMWithUsage(activeMessages, settings);
 
-    // 8. Send message to Telegram
-    const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: botResponse
-      })
-    });
+      finalBotResponse = content;
 
-    if (!response.ok) {
-      console.error('Failed to send Telegram response message');
+      const sshMatch = content.match(/<ssh_run>([\s\S]*?)<\/ssh_run>/);
+      if (sshMatch && isSshConfigured) {
+        const command = sshMatch[1].trim();
+        console.log(`Telegram Bot: LLM requested SSH command execution: ${command}`);
+
+        // Save LLM's action to DB
+        await db.query(
+          'INSERT INTO messages (session_id, role, content, prompt_tokens, completion_tokens) VALUES ($1, $2, $3, $4, $5)',
+          [chatId, 'assistant', content, usage.prompt_tokens, usage.completion_tokens]
+        );
+
+        // Generate unique pending approval ID
+        const pendingId = `ssh_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+        
+        let resolveApproval;
+        const approvalPromise = new Promise((resolve) => {
+          resolveApproval = resolve;
+        });
+
+        // Prompt the user on Telegram with inline keyboard
+        const promptRes = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: chatId,
+            text: `⚠️ *Asisten ingin menjalankan perintah berikut di server:*\n\`\`\`bash\n${command}\n\`\`\``,
+            parse_mode: 'Markdown',
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  { text: '✅ Setujui (Run)', callback_data: `approve:${pendingId}` },
+                  { text: '❌ Tolak (Cancel)', callback_data: `reject:${pendingId}` }
+                ]
+              ]
+            }
+          })
+        });
+
+        let messageObjId = null;
+        if (promptRes.ok) {
+          const promptData = await promptRes.json();
+          messageObjId = promptData.result?.message_id;
+        }
+
+        // Set timeout to auto-reject after 5 minutes (300,000 ms)
+        const timeoutId = setTimeout(() => {
+          if (pendingApprovals.has(pendingId)) {
+            if (messageObjId) {
+              fetch(`https://api.telegram.org/bot${token}/editMessageText`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  chat_id: chatId,
+                  message_id: messageObjId,
+                  text: `⚠️ *Permintaan Eksekusi Perintah (Kedaluwarsa):*\n\`\`\`bash\n${command}\n\`\`\``,
+                  parse_mode: 'Markdown'
+                })
+              }).catch(() => {});
+            }
+            resolveApproval(false);
+            pendingApprovals.delete(pendingId);
+          }
+        }, 300000);
+
+        // Store resolve details
+        pendingApprovals.set(pendingId, {
+          command,
+          resolve: (val) => {
+            clearTimeout(timeoutId);
+            resolveApproval(val);
+          },
+          chatId
+        });
+
+        // Await user's button action
+        const isApproved = await approvalPromise;
+
+        let toolResultMessage = '';
+        if (isApproved) {
+          // Send running status to Telegram
+          await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: chatId,
+              text: `🛠️ *Running SSH command...*`,
+              parse_mode: 'Markdown'
+            })
+          }).catch(() => {});
+
+          // Execute remote command
+          const execResult = await executeRemoteCommand(command, settings);
+          const outputText = `Command: ${command}\nExit Code: ${execResult.code}\nStdout:\n${execResult.stdout}\nStderr:\n${execResult.stderr}`;
+
+          toolResultMessage = `<ssh_output>\n${outputText}\n</ssh_output>`;
+
+          // Send execution result update
+          let telegramResultSnippet = execResult.stdout || execResult.stderr || '(No Output)';
+          if (telegramResultSnippet.length > 1000) {
+            telegramResultSnippet = telegramResultSnippet.slice(0, 1000) + '\n\n... (output truncated)';
+          }
+          await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: chatId,
+              text: `📝 *Execution Output (Code ${execResult.code}):*\n\`\`\`\n${telegramResultSnippet}\n\`\`\``,
+              parse_mode: 'Markdown'
+            })
+          }).catch(() => {});
+        } else {
+          // Rejection branch
+          toolResultMessage = `<ssh_output>\nExecution rejected by user. Command was not run.\n</ssh_output>`;
+        }
+
+        // Save results to DB
+        await db.query(
+          'INSERT INTO messages (session_id, role, content) VALUES ($1, $2, $3)',
+          [chatId, 'user', toolResultMessage]
+        );
+
+        // Append to active context
+        activeMessages.push({ role: 'assistant', content: content });
+        activeMessages.push({
+          role: 'user',
+          content: isApproved 
+            ? `${toolResultMessage}\n\nPlease inspect the output and proceed. If you have finished the user's task, respond to the user. If you need to run another command, output another <ssh_run> tag.`
+            : `${toolResultMessage}\n\nThe user rejected the execution of this command. Do not try running it again unless they change their mind. Please formulate an alternative approach or explain that the command was rejected.`
+        });
+
+        loopCount++;
+      } else {
+        // Final response
+        await db.query(
+          'INSERT INTO messages (session_id, role, content, prompt_tokens, completion_tokens) VALUES ($1, $2, $3, $4, $5)',
+          [chatId, 'assistant', content, usage.prompt_tokens, usage.completion_tokens]
+        );
+
+        await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: chatId,
+            text: content
+          })
+        });
+        break;
+      }
     }
 
-    // 9. Extract memories in background
-    extractAndStoreMemories(userText, botResponse, settings);
+    // Extract memories in background
+    extractAndStoreMemories(userText, finalBotResponse, settings);
 
   } catch (error) {
     console.error('Error handling Telegram message:', error);

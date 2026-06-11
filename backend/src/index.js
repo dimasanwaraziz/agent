@@ -5,6 +5,7 @@ import { callLLM, callLLMWithUsage, extractAndStoreMemories } from './llm.js';
 import { retrieveRelevantMemories } from './memoryService.js';
 import { initTelegramBot } from './telegram.js';
 import { searchWeb } from './search.js';
+import { executeRemoteCommand } from './sshExecutor.js';
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -34,7 +35,12 @@ async function getActiveSettings() {
     memorySimilarity: currentSettings.memorySimilarity !== undefined ? parseFloat(currentSettings.memorySimilarity) : 0.4,
     telegramBotToken: currentSettings.telegramBotToken || '',
     inputCostPerMillion: currentSettings.inputCostPerMillion !== undefined ? parseFloat(currentSettings.inputCostPerMillion) : 0.15,
-    outputCostPerMillion: currentSettings.outputCostPerMillion !== undefined ? parseFloat(currentSettings.outputCostPerMillion) : 0.60
+    outputCostPerMillion: currentSettings.outputCostPerMillion !== undefined ? parseFloat(currentSettings.outputCostPerMillion) : 0.60,
+    sshHost: currentSettings.sshHost || '',
+    sshUser: currentSettings.sshUser || '',
+    sshPort: currentSettings.sshPort || '22',
+    sshPassword: currentSettings.sshPassword || '',
+    sshPrivateKey: currentSettings.sshPrivateKey || ''
   };
 }
 
@@ -94,7 +100,7 @@ app.get('/api/settings', async (req, res) => {
 
 app.post('/api/settings', async (req, res) => {
   try {
-    const { apiBaseUrl, apiKey, model, systemPrompt, temperature, memorySimilarity, telegramBotToken, inputCostPerMillion, outputCostPerMillion } = req.body;
+    const { apiBaseUrl, apiKey, model, systemPrompt, temperature, memorySimilarity, telegramBotToken, inputCostPerMillion, outputCostPerMillion, sshHost, sshUser, sshPort, sshPassword, sshPrivateKey } = req.body;
     
     if (apiBaseUrl !== undefined) await db.saveSetting('apiBaseUrl', apiBaseUrl);
     if (apiKey !== undefined) await db.saveSetting('apiKey', apiKey);
@@ -105,6 +111,11 @@ app.post('/api/settings', async (req, res) => {
     if (telegramBotToken !== undefined) await db.saveSetting('telegramBotToken', telegramBotToken);
     if (inputCostPerMillion !== undefined) await db.saveSetting('inputCostPerMillion', inputCostPerMillion.toString());
     if (outputCostPerMillion !== undefined) await db.saveSetting('outputCostPerMillion', outputCostPerMillion.toString());
+    if (sshHost !== undefined) await db.saveSetting('sshHost', sshHost);
+    if (sshUser !== undefined) await db.saveSetting('sshUser', sshUser);
+    if (sshPort !== undefined) await db.saveSetting('sshPort', sshPort.toString());
+    if (sshPassword !== undefined) await db.saveSetting('sshPassword', sshPassword);
+    if (sshPrivateKey !== undefined) await db.saveSetting('sshPrivateKey', sshPrivateKey);
 
     // Restart Telegram Bot with new settings
     initTelegramBot();
@@ -144,6 +155,49 @@ app.get('/api/usage', async (req, res) => {
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+// 2.3 SSH Test Connection Endpoint
+app.post('/api/ssh/test', async (req, res) => {
+  try {
+    const settings = await getActiveSettings();
+    
+    // Check if host and user are set (either passed in request body or loaded from db)
+    const host = req.body.sshHost !== undefined ? req.body.sshHost : settings.sshHost;
+    const user = req.body.sshUser !== undefined ? req.body.sshUser : settings.sshUser;
+    
+    if (!host || !user) {
+      return res.status(400).json({ success: false, error: 'SSH Host and User are required to test connection.' });
+    }
+
+    const config = {
+      sshHost: host,
+      sshUser: user,
+      sshPort: req.body.sshPort !== undefined ? req.body.sshPort : settings.sshPort,
+      sshPassword: req.body.sshPassword !== undefined ? req.body.sshPassword : settings.sshPassword,
+      sshPrivateKey: req.body.sshPrivateKey !== undefined ? req.body.sshPrivateKey : settings.sshPrivateKey
+    };
+
+    console.log(`Testing SSH connection to: ${user}@${host}`);
+    // Run simple diagnostics command: print system info
+    const testResult = await executeRemoteCommand('uname -a && echo "SSH connection check passed!"', config);
+    
+    if (testResult.code === 0) {
+      res.json({
+        success: true,
+        output: testResult.stdout,
+        error: null
+      });
+    } else {
+      res.json({
+        success: false,
+        output: null,
+        error: testResult.stderr || 'SSH connection failed.'
+      });
+    }
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
@@ -214,7 +268,7 @@ app.delete('/api/messages', async (req, res) => {
   }
 });
 
-// 5. Chat Endpoint with RAG Memory & Background Fact Extraction
+// 5. Chat Endpoint with RAG Memory, SSH Coding Loop & Background Fact Extraction
 app.post('/api/chat', async (req, res) => {
   try {
     const { sessionId, message } = req.body;
@@ -296,34 +350,108 @@ app.post('/api/chat', async (req, res) => {
       console.error('Web search preprocessing failed:', err);
     }
 
+    let sshContext = '';
+    const isSshConfigured = !!(settings.sshHost && settings.sshUser);
+    if (isSshConfigured) {
+      sshContext = `\n\nREMOTE CODING & SERVER EXECUTION CAPABILITIES:
+You are equipped to write code, inspect files, compile, and execute terminal commands on the user's remote server via SSH.
+To execute a command on the remote server, output a command inside the following XML tag:
+<ssh_run>YOUR_COMMAND_HERE</ssh_run>
+
+For example, to list the current directory:
+<ssh_run>ls -la</ssh_run>
+
+To view the contents of a file:
+<ssh_run>cat src/main.js</ssh_run>
+
+To create or overwrite a file:
+<ssh_run>cat << 'EOF' > test.py
+print("Hello from PA")
+EOF</ssh_run>
+
+To run or compile a file:
+<ssh_run>python3 test.py</ssh_run>
+
+IMPORTANT RULES:
+1. Always output exactly one <ssh_run> tag per message. Once you output the tag, STOP generating text. The system will execute the command and return the output inside <ssh_output> tags.
+2. After receiving the output, you can choose to output another command or present your final answer.
+3. Be careful with command outputs. If you execute a script, ensure it finishes or has a reasonable timeout.
+4. Try to write files programmatically using non-interactive tools (like 'cat << "EOF" > path'). Avoid tools like nano, vim, or interactive prompts.
+5. If the user asks you to write code, deploy something, or fix an issue, proactively use these tools to perform the task!`;
+    }
+
     const systemMessage = {
       role: 'system',
-      content: `${settings.systemPrompt}\n\n${memoryContext}${webContext}\n\nPlease use the recalled facts or web search results if they are relevant to answer the user's message. Do not explicitly state "Based on the retrieved facts" or "According to the search results", just answer naturally as if you remember them yourself.`
+      content: `${settings.systemPrompt}\n\n${memoryContext}${webContext}${sshContext}\n\nPlease use the recalled facts, web search results, or remote execution outputs if they are relevant to answer the user's message.`
     };
 
     // E. Assemble full messages array
-    // Map existing history to correct API format, ensuring system prompt is first
-    const llmMessages = [
+    let activeMessages = [
       systemMessage,
       ...shortTermHistory.map(m => ({ role: m.role, content: m.content }))
     ];
 
-    // F. Call LLM with token usage tracking
-    const { content: assistantResponse, usage } = await callLLMWithUsage(llmMessages, settings);
+    let loopCount = 0;
+    const maxLoops = 5;
+    let finalAssistantResponse = '';
+    let totalUsage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
 
-    // G. Save Assistant Message and token stats to DB
-    await db.query(
-      'INSERT INTO messages (session_id, role, content, prompt_tokens, completion_tokens) VALUES ($1, $2, $3, $4, $5)',
-      [sessionId, 'assistant', assistantResponse, usage.prompt_tokens, usage.completion_tokens]
-    );
+    while (loopCount < maxLoops) {
+      console.log(`Executing chat loop step ${loopCount + 1}...`);
+      const { content, usage } = await callLLMWithUsage(activeMessages, settings);
+      totalUsage.prompt_tokens += usage.prompt_tokens;
+      totalUsage.completion_tokens += usage.completion_tokens;
+      totalUsage.total_tokens += usage.total_tokens;
+
+      finalAssistantResponse = content;
+
+      const sshMatch = content.match(/<ssh_run>([\s\S]*?)<\/ssh_run>/);
+      if (sshMatch && isSshConfigured) {
+        const command = sshMatch[1].trim();
+        console.log(`LLM requested remote SSH execution: ${command}`);
+
+        // Save LLM's action to DB
+        await db.query(
+          'INSERT INTO messages (session_id, role, content, prompt_tokens, completion_tokens) VALUES ($1, $2, $3, $4, $5)',
+          [sessionId, 'assistant', content, usage.prompt_tokens, usage.completion_tokens]
+        );
+
+        // Execute remote command
+        const execResult = await executeRemoteCommand(command, settings);
+        const outputText = `Command: ${command}\nExit Code: ${execResult.code}\nStdout:\n${execResult.stdout}\nStderr:\n${execResult.stderr}`;
+
+        // Save command execution results to DB as a system/user context update
+        const toolResultMessage = `<ssh_output>\n${outputText}\n</ssh_output>`;
+        await db.query(
+          'INSERT INTO messages (session_id, role, content) VALUES ($1, $2, $3)',
+          [sessionId, 'user', toolResultMessage]
+        );
+
+        // Append to activeMessages context
+        activeMessages.push({ role: 'assistant', content: content });
+        activeMessages.push({
+          role: 'user',
+          content: `${toolResultMessage}\n\nPlease inspect the output and proceed. If you have finished the user's task, respond to the user. If you need to run another command, output another <ssh_run> tag.`
+        });
+
+        loopCount++;
+      } else {
+        // No command requested, or SSH not configured. This is the final response.
+        await db.query(
+          'INSERT INTO messages (session_id, role, content, prompt_tokens, completion_tokens) VALUES ($1, $2, $3, $4, $5)',
+          [sessionId, 'assistant', content, usage.prompt_tokens, usage.completion_tokens]
+        );
+        break;
+      }
+    }
 
     // H. Schedule background memory extraction (do not await to speed up response)
-    extractAndStoreMemories(message, assistantResponse, settings);
+    extractAndStoreMemories(message, finalAssistantResponse, settings);
 
     res.json({
-      response: assistantResponse,
+      response: finalAssistantResponse,
       memoriesUsed: matchingMemories,
-      usage
+      usage: totalUsage
     });
 
   } catch (error) {

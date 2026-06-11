@@ -54,6 +54,11 @@ interface AgentSettings {
   telegramBotToken: string;
   inputCostPerMillion: number;
   outputCostPerMillion: number;
+  sshHost?: string;
+  sshUser?: string;
+  sshPort?: number;
+  sshPassword?: string;
+  sshPrivateKey?: string;
 }
 
 export default function App() {
@@ -94,8 +99,17 @@ export default function App() {
     memorySimilarity: 0.4,
     telegramBotToken: '',
     inputCostPerMillion: 0.15,
-    outputCostPerMillion: 0.60
+    outputCostPerMillion: 0.60,
+    sshHost: '',
+    sshUser: '',
+    sshPort: 22,
+    sshPassword: '',
+    sshPrivateKey: ''
   });
+
+  // SSH Testing State
+  const [testingSsh, setTestingSsh] = useState<boolean>(false);
+  const [sshTestResult, setSshTestResult] = useState<{ success: boolean; output: string | null; error: string | null } | null>(null);
 
   const [usageStats, setUsageStats] = useState<{
     promptTokens: number;
@@ -347,6 +361,34 @@ export default function App() {
       setSettingsStatusMessage(`❌ Error: ${err.message}`);
     } finally {
       setSavingSettings(false);
+    }
+  };
+
+  const handleTestSsh = async () => {
+    setTestingSsh(true);
+    setSshTestResult(null);
+    try {
+      const res = await fetch(`${API_BASE}/ssh/test`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sshHost: settings.sshHost,
+          sshUser: settings.sshUser,
+          sshPort: settings.sshPort,
+          sshPassword: settings.sshPassword,
+          sshPrivateKey: settings.sshPrivateKey
+        })
+      });
+      const data = await res.json();
+      setSshTestResult(data);
+    } catch (err: any) {
+      setSshTestResult({
+        success: false,
+        output: null,
+        error: err.message || 'Gagal menghubungi server backend.'
+      });
+    } finally {
+      setTestingSsh(false);
     }
   };
 
@@ -885,6 +927,121 @@ export default function App() {
                     2. Salin token API yang diberikan dan tempel di atas.<br />
                     3. Simpan konfigurasi ini, lalu mulai chat dengan bot Telegram Anda! Memori jangka panjang akan tetap dibagikan secara otomatis.
                   </span>
+                </div>
+              </div>
+
+              <div className="settings-section">
+                <div className="settings-section-title">
+                  <Cpu size={18} style={{ color: 'var(--accent-color)' }} />
+                  <span>Konfigurasi SSH Server (Remote Coding/Terminal)</span>
+                </div>
+                
+                <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 1fr', gap: '16px', marginBottom: '16px' }}>
+                  <div className="form-group" style={{ margin: 0 }}>
+                    <label htmlFor="sshHost">Host / IP Address</label>
+                    <input 
+                      id="sshHost"
+                      type="text" 
+                      className="form-control"
+                      placeholder="Contoh: 192.168.1.100"
+                      value={settings.sshHost || ''}
+                      onChange={(e) => setSettings({ ...settings, sshHost: e.target.value })}
+                    />
+                  </div>
+                  <div className="form-group" style={{ margin: 0 }}>
+                    <label htmlFor="sshUser">SSH User</label>
+                    <input 
+                      id="sshUser"
+                      type="text" 
+                      className="form-control"
+                      placeholder="Contoh: root"
+                      value={settings.sshUser || ''}
+                      onChange={(e) => setSettings({ ...settings, sshUser: e.target.value })}
+                    />
+                  </div>
+                  <div className="form-group" style={{ margin: 0 }}>
+                    <label htmlFor="sshPort">SSH Port</label>
+                    <input 
+                      id="sshPort"
+                      type="number" 
+                      className="form-control"
+                      placeholder="22"
+                      value={settings.sshPort || 22}
+                      onChange={(e) => setSettings({ ...settings, sshPort: parseInt(e.target.value) || 22 })}
+                    />
+                  </div>
+                </div>
+
+                <div className="form-group">
+                  <label htmlFor="sshPassword">SSH Password (Opsional jika pakai Private Key)</label>
+                  <input 
+                    id="sshPassword"
+                    type="password" 
+                    className="form-control"
+                    placeholder="Masukkan password SSH"
+                    value={settings.sshPassword || ''}
+                    onChange={(e) => setSettings({ ...settings, sshPassword: e.target.value })}
+                  />
+                </div>
+
+                <div className="form-group">
+                  <label htmlFor="sshPrivateKey">SSH Private Key (Opsional jika pakai Password)</label>
+                  <textarea 
+                    id="sshPrivateKey"
+                    className="form-control"
+                    rows={4}
+                    placeholder="-----BEGIN OPENSSH PRIVATE KEY-----\n..."
+                    style={{ resize: 'vertical', fontFamily: 'monospace', fontSize: '0.8rem' }}
+                    value={settings.sshPrivateKey || ''}
+                    onChange={(e) => setSettings({ ...settings, sshPrivateKey: e.target.value })}
+                  />
+                </div>
+
+                <div style={{ marginTop: '12px' }}>
+                  <button 
+                    type="button" 
+                    className="test-connection-btn"
+                    onClick={handleTestSsh} 
+                    disabled={testingSsh || !settings.sshHost || !settings.sshUser}
+                    style={{
+                      background: 'var(--bg-card)',
+                      border: '1px solid var(--border-color)',
+                      color: 'var(--text-main)',
+                      padding: '8px 16px',
+                      borderRadius: '6px',
+                      cursor: 'pointer',
+                      fontSize: '0.9rem',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '8px',
+                      transition: 'all 0.2s'
+                    }}
+                  >
+                    {testingSsh ? <Loader2 size={16} className="animate-spin" /> : <RefreshCw size={16} />}
+                    Test Koneksi SSH
+                  </button>
+                  {sshTestResult && (
+                    <div style={{ 
+                      marginTop: '12px', 
+                      padding: '12px', 
+                      borderRadius: '6px', 
+                      backgroundColor: sshTestResult.success ? 'rgba(46, 213, 115, 0.1)' : 'rgba(255, 71, 87, 0.1)',
+                      border: `1px solid ${sshTestResult.success ? '#2ed573' : '#ff4757'}`,
+                      fontSize: '0.85rem'
+                    }}>
+                      {sshTestResult.success ? (
+                        <>
+                          <div style={{ color: '#2ed573', fontWeight: 'bold', marginBottom: '4px' }}>✓ Koneksi Sukses!</div>
+                          <pre style={{ margin: 0, overflowX: 'auto', whiteSpace: 'pre-wrap' }}>{sshTestResult.output}</pre>
+                        </>
+                      ) : (
+                        <>
+                          <div style={{ color: '#ff4757', fontWeight: 'bold', marginBottom: '4px' }}>✗ Koneksi Gagal</div>
+                          <div style={{ color: 'var(--text-main)' }}>{sshTestResult.error}</div>
+                        </>
+                      )}
+                    </div>
+                  )}
                 </div>
               </div>
 
