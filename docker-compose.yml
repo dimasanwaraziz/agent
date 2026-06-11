@@ -32,6 +32,8 @@ services:
         condition: service_healthy
     volumes:
       - huggingface_cache:/root/.cache
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
   frontend:
     build:
