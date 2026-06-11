@@ -4,6 +4,7 @@ import * as db from './db.js';
 import { callLLM, extractAndStoreMemories } from './llm.js';
 import { retrieveRelevantMemories } from './memoryService.js';
 import { initTelegramBot } from './telegram.js';
+import { searchWeb } from './search.js';
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -216,9 +217,52 @@ app.post('/api/chat', async (req, res) => {
       memoryContext = `Recall these facts about the user / past events:\n${matchingMemories.map(m => `- ${m.content}`).join('\n')}\n\n`;
     }
 
+    // D2. Determine if web search is needed
+    let webContext = '';
+    try {
+      const checkPrompt = [
+        {
+          role: 'system',
+          content: 'You are a query classifier. Analyze the user message and determine if it requires looking up real-time information, current events (events or facts after 2024), current weather, today\'s news, or general live web search to answer accurately. Respond ONLY with "YES" or "NO". Do not output anything else.'
+        },
+        {
+          role: 'user',
+          content: message
+        }
+      ];
+
+      console.log('Classifying query for web search...');
+      const checkResult = await callLLM(checkPrompt, { ...settings, temperature: 0.0 });
+      console.log(`Web search classification: ${checkResult.trim()}`);
+
+      if (checkResult.trim().toUpperCase() === 'YES') {
+        const extractionPrompt = [
+          {
+            role: 'system',
+            content: 'You are a search query generator. Create a simple, optimized search engine query (2 to 5 words) based on the user\'s message. Output ONLY the search query. Do not include quotes, explanations, or punctuation.'
+          },
+          {
+            role: 'user',
+            content: message
+          }
+        ];
+        const rawSearchQuery = await callLLM(extractionPrompt, { ...settings, temperature: 0.1 });
+        const cleanQuery = rawSearchQuery.replace(/["']/g, '').trim();
+
+        const searchResults = await searchWeb(cleanQuery);
+        if (searchResults.length > 0) {
+          webContext = `Current Web Search Results:\n` +
+            searchResults.map(r => `[Title: ${r.title}]\nURL: ${r.link}\nSummary: ${r.snippet}`).join('\n\n') +
+            `\n\nUse the above fresh search results to provide a factual, up-to-date response. Cite the URLs if relevant.`;
+        }
+      }
+    } catch (err) {
+      console.error('Web search preprocessing failed:', err);
+    }
+
     const systemMessage = {
       role: 'system',
-      content: `${settings.systemPrompt}\n\n${memoryContext}Please use the recalled facts if they are relevant to answer the user's message. Do not explicitly state "Based on the retrieved facts" or similar, just answer naturally as if you remember them yourself.`
+      content: `${settings.systemPrompt}\n\n${memoryContext}${webContext}\n\nPlease use the recalled facts or web search results if they are relevant to answer the user's message. Do not explicitly state "Based on the retrieved facts" or "According to the search results", just answer naturally as if you remember them yourself.`
     };
 
     // E. Assemble full messages array
